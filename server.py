@@ -1,9 +1,10 @@
 import asyncio
 import importlib
+import logging
 import socket
+import threading
 from typing import Callable, Coroutine, TypedDict, Tuple, Iterable
 from enum import Enum
-import logging
 from sys import stdout, exit
 from urllib.parse import unquote
 from itertools import chain
@@ -54,6 +55,9 @@ class ParserInfo(TypedDict):
     content_length: str|int
     chunked_encoding: bool
     http_version_str: str
+    req_path:str
+    req_addr:str
+    req_method:str
 
 class ASGISendArg(TypedDict):
     type: str
@@ -71,6 +75,9 @@ DEFAULT_SCOPE_PARAMS = {
         "spec_version": ASGI_VERSION,
     }
 }
+DEFAULT_RESPONSE_HEADERS= [
+    (b"Server", SERVER_NAME.encode("ascii"))
+]
 
 # TODO:
 # Exception handling
@@ -79,9 +86,10 @@ class Server:
     _asgi_version = ASGI_VERSION
 
     def __init__(self, port:int, host:str=''):
+        self.id:int = threading.get_native_id() # >=py3.8
         self.host:str = host
         self.port:int = port
-        self.tls_enabled = False # TODO:
+        self.tls_enabled = False # TODO: tls support
         self.life_span:LifeSpan = LifeSpan.IDLE
         self.life_span_state = dict()
         self._common_scopes = {
@@ -92,31 +100,31 @@ class Server:
         self.app: Callable[[dict, Callable, Callable], Coroutine]
 
     def load_app(self, ref_path:str):
-        module, _callable = "", ""
+        _module, _callable = "", ""
         try:
             if ":" in ref_path:
-                module, _callable = ref_path.split(":")
+                _module, _callable = ref_path.split(":")
             elif "." in ref_path:
                 path_mods = ref_path.split(".")
                 if len(path_mods) < 2:
                     raise ValueError()
-                module = ".".join(path_mods[:-1])
+                _module = ".".join(path_mods[:-1])
                 _callable = path_mods[-1]
             else:
                 raise ValueError()
         except:
-            _logger.error(f"Invalid ASGI app identifier: {ref_path}")
             raise ValueError(f"Invalid ASGI app identifier: {ref_path}")
         try:
-            module = importlib.import_module(module)
+            module = importlib.import_module(_module)
+        except:
+            raise ImportError(f"Error importing module: {_module}")
+        try:
             app = getattr(module, _callable)
             self.app = app
         except:
-            _logger.error(f"Error importing ASGI app: {ref_path}")
-            raise ImportError()
+            raise ImportError(f"Attribute '{_callable}' not found in module '{_module}'")
         if not callable(self.app):
-            _logger.error(f"ASGI app is not callable: {ref_path}")
-            raise ValueError()
+            raise ValueError(f"ASGI app is not callable: {ref_path}")
 
     async def lifespan_recv(self):
         await asyncio.sleep(0)
@@ -149,10 +157,12 @@ class Server:
             reuse_address=True,
             reuse_port=True,
         )
+        _logger.info(f"Started server process [{self.id}]")
         self._addr = server.sockets[0].getsockname()[:2]
         async with server:
             self.life_span = LifeSpan.STARTUP
             # lifespan
+            _logger.info("Waiting for application startup.")
             asyncio.create_task(
                 self.app(
                     {
@@ -164,25 +174,34 @@ class Server:
                 )
             )
             await self.wait_ready_state()
+            _logger.info("Application startup completed.")
+
             try:
-                _logger.info(f"Listening on {f"{self._addr[0]}:{self._addr[1]}"}")
+                _logger.info(
+                    f"{SERVER_NAME.title()} listening on "
+                    f"http{'s' if self.tls_enabled else ''}://{self._addr[0]}:{self._addr[1]} "
+                    "(Press CTRL+C to quit)"
+                )
                 await server.serve_forever()
             except BaseException as exp:
                 self.life_span = LifeSpan.SHUTDOWN
-                _logger.error(f"Inturrput received! Closing server: {exp}")
+                _logger.error(f"Interrupt received! Shutting down: {exp}")
+                _logger.info("Waiting for application shutdown.")
+                await self.wait_ready_state()
+                _logger.info("Application shutdown complete.")
+                _logger.info(f"Finished server process [{self.id}]")
 
     async def _parse_header_line(self, reader:asyncio.StreamReader, spec:dict, parser_info:ParserInfo):
+        # as of now not respecting any pseudo headers
         header_line = await reader.readline()
         header_line = header_line.decode("ascii").strip().rstrip("\r")
         header_line_comps = header_line.split(" ")
         if len(header_line_comps) != 3:
-            # TODO
-            _logger.warning("Invalid request headerline!")
+            _logger.debug("Invalid request headerline!")
             return
         http_version = header_line_comps[2].split("/")[-1]
         if http_version not in HTTP_VERSIONS:
-            # TODO
-            _logger.warning("Invalid http protocol!")
+            _logger.debug("Invalid http protocol!")
             return
         parser_info["http_version_str"] = header_line_comps[2].upper()
         spec["method"] = header_line_comps[0].upper()
@@ -219,7 +238,7 @@ class Server:
         spec["raw_path"] = path.encode("utf-8")
         spec["root_path"] = ""
 
-    def _parse_type(self, spec:dict, parser_info:ParserInfo):
+    def _parse_info(self, spec:dict, parser_info:ParserInfo):
         spec["type"] = ASGIScopeType.HTTP.value
         spec["scheme"] = "https" if self.tls_enabled else "http"
         for key, val in spec["headers"]:
@@ -232,6 +251,39 @@ class Server:
                 parser_info["content_length"] = val.decode("utf-8")
             elif key == b"transfer-encoding" and val == b"chunked":
                 parser_info["chunked_encoding"] = True
+        parser_info["req_method"] = spec["method"]
+        parser_info["req_path"] = spec["path"]
+
+    def _write_response_header(
+        self,
+        writer:asyncio.StreamWriter,
+        status:int,
+        parser_info:ParserInfo,
+        headers:Iterable[Tuple[bytes, bytes]],
+        content_len:int|None=None
+    ) -> bool:
+        _found_content_len = False
+        msg = StatusMessages.default
+        if f"status_{status}" in StatusMessages.__members__:
+            msg = StatusMessages[f"status_{status}"]
+
+        writer.write((
+            f"{parser_info['http_version_str']} {status} {msg.value}\r\n"
+        ).encode("ascii"))
+
+        for key, val in headers:
+            if key.decode("utf-8").lower() == "content-length":
+                _found_content_len = True
+            writer.write(key + b": " + val + b"\r\n")
+
+        if not _found_content_len and content_len is not None:
+            writer.write(f"Content-Length: {content_len}\r\n".encode("ascii"))
+        _logger.info(
+            f"{parser_info['req_addr']} - "
+            f"\"{parser_info['req_method'].upper()} {parser_info['req_path']} {parser_info['http_version_str']}\" "
+            f"- {status} {msg.value}"
+        )
+        return _found_content_len
 
     def compose_http_recv(self, reader:asyncio.StreamReader, parser_info:ParserInfo):
         remaining = True
@@ -279,30 +331,17 @@ class Server:
 
     def compose_http_send(self, writer:asyncio.StreamWriter, parser_info:ParserInfo):
         # TODO: might try to reduce the cyclomatic complexity
-        _headers = [(b"server", SERVER_NAME.encode("ascii"))]
+        _headers = [*DEFAULT_RESPONSE_HEADERS]
         _status = 200
         _trailers = False
         _body = bytearray()
         _header_send = False
-        _found_content_len = False
         _chunked_encoding = False
 
-        def write_header(content_len=None):
-            nonlocal _found_content_len
-            msg = StatusMessages.default
-            if f"status_{_status}" in StatusMessages.__members__:
-                msg = StatusMessages[f"status_{_status}"]
-            writer.write((
-                f"{parser_info['http_version_str']} {_status} {msg.value}\r\n"
-            ).encode("ascii"))
-            for key, val in _headers:
-                if key.decode("utf-8").lower() == "content-length":
-                    _found_content_len = True
-                writer.write(key + b": " + val + b"\r\n")
-            if not _found_content_len and content_len is not None:
-                writer.write(f"Content-Length: {content_len}\r\n".encode("ascii"))
-
         async def http_send(msg:ASGISendArg):
+            if writer.is_closing():
+                raise OSError("[pycorn] Attempt to write on a closed client-connection!")
+
             nonlocal _headers, _status, _trailers, _body, _header_send, _chunked_encoding
             type = msg.get("type")
             status = msg.get("status", 200)
@@ -310,9 +349,6 @@ class Server:
             trailers = msg.get("trailers", False)
             body = msg.get("body", b"")
             more_body = msg.get("more_body", False)
-
-            if writer.is_closing():
-                raise OSError("[pycorn] Attempt to write on a closed client-connection!")
 
             # TODO test cases for all
             if type == "http.response.start":
@@ -325,8 +361,7 @@ class Server:
                     _body.extend(body)
                     return
                 if not _header_send:
-                    write_header(None)
-                    if not _found_content_len:
+                    if not self._write_response_header(writer, _status, parser_info, _headers):
                         if not more_body:
                             writer.write(f"Content-Length: {len(body)}\r\n".encode("ascii"))
                         else:
@@ -348,7 +383,7 @@ class Server:
             elif type == "http.response.trailers":
                 _body.extend(body)
                 t_body = bytes(_body)
-                write_header(len(t_body))
+                self._write_response_header(writer, _status, parser_info, _headers, len(t_body))
                 writer.write(b"\r\n")
                 writer.write(t_body)
                 await writer.drain()
@@ -361,16 +396,25 @@ class Server:
         return http_send
 
     async def write_errors(self, writer:asyncio.StreamWriter, status:int, _parser_info:ParserInfo, message:str=""):
-        status_msg = StatusMessages.default
-        if f"status_{status}" in StatusMessages.__members__:
-            status_msg = StatusMessages[f"status_{status}"]
-        writer.write(f"{_parser_info['http_version_str']} {status} {status_msg.value}\r\n".encode("ascii"))
+        if writer.is_closing():
+            raise OSError("[pycorn] Attempt to write on a closed client-connection!")
 
-        msg = message or status_msg.value
-        msg = msg.encode("ascii")
-        writer.write(f"Server: {SERVER_NAME}\r\n".encode("ascii"))
-        writer.write(b"Content-Type: text/plain\r\n")
-        writer.write(f"Content-Length: {len(msg)}\r\n".encode("ascii"))
+        if not message:
+            if f"status_{status}" in StatusMessages.__members__:
+                message = StatusMessages[f"status_{status}"].value
+            else: message = StatusMessages.default.value
+        msg = message.encode("ascii")
+
+        self._write_response_header(
+            writer,
+            status,
+            _parser_info,
+            [
+                *DEFAULT_RESPONSE_HEADERS,
+                (b"Content-Type", b"text/plain"),
+            ],
+            content_len=len(msg),
+        )
         writer.write(b"\r\n")
         writer.write(msg)
         await writer.drain()
@@ -382,7 +426,10 @@ class Server:
         _parser_info:ParserInfo = {
             "content_length": "",
             "chunked_encoding": False,
-            "http_version_str": "HTTP/1.1"
+            "http_version_str": "HTTP/1.1",
+            "req_path": "",
+            "req_addr": "",
+            "req_method": ""
         }
         try:
             if not await self._parse_header_line(reader, _spec, _parser_info):
@@ -392,10 +439,11 @@ class Server:
                 await self.write_errors(writer, 400, _parser_info, "Bad Request!")
                 return
             self._parse_pathname(_spec)
-            self._parse_type(_spec, _parser_info)
+            self._parse_info(_spec, _parser_info)
             _spec["client"] = writer.get_extra_info('peername')[:2]
             _spec["server"] = self._addr
             _spec["state"] = self.life_span_state
+            _parser_info["req_addr"] = _spec["client"][0]
         except Exception as exp:
             _logger.error(f"Error parsing request: {exp}")
             await self.write_errors(writer, 400, _parser_info, "Bad Request!")
@@ -407,8 +455,10 @@ class Server:
                     self.compose_http_recv(reader, _parser_info),
                     self.compose_http_send(writer, _parser_info),
                 )
-            else:
+            elif _spec["type"] == ASGIScopeType.WEBSOCKET.value:
                 # TODO
+                ...
+            else:
                 NotImplementedError("Websocket recv and send handlers not implemented")
         except Exception as exp:
             _logger.exception(exp)
@@ -426,7 +476,7 @@ if __name__ == "__main__":
 
     server = Server(8080)
     try: server.load_app(app_ref)
-    except:
-        _logger.critical("Error loading app!")
+    except Exception as exp:
+        _logger.critical(f"Error loading ASGI app. {exp}")
         exit(2)
     asyncio.run(server.start_server())
