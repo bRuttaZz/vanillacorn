@@ -1,8 +1,13 @@
+__version__ = "0.0.1"
+
+import argparse
 import asyncio
 import importlib
 import logging
+import multiprocessing
+import os
+import sys
 import socket
-import threading
 from enum import Enum
 from itertools import chain
 from sys import stdout, exit
@@ -14,7 +19,7 @@ _logger.setLevel(logging.DEBUG)
 _logger.addHandler(logging.StreamHandler(stream=stdout))
 
 ASGI_VERSION = "2.0"  # (2019-03-20)
-SERVER_NAME = "pycorn"
+SERVER_NAME = "vanillacorn"
 
 
 class ASGIScopeType(Enum):
@@ -89,10 +94,20 @@ DEFAULT_RESPONSE_HEADERS = [(b"Server", SERVER_NAME.encode("ascii"))]
 class Server:
     _asgi_version = ASGI_VERSION
 
-    def __init__(self, port: int, host: str = ""):
-        self.id: int = threading.get_native_id()  # >=py3.8
+    def __init__(
+        self,
+        app: Callable[[dict, Callable, Callable], Coroutine] | str,
+        port: int = 8075,
+        host: str = "localhost",
+    ):
+        self.id: int | None = None
         self.host: str = host
         self.port: int = port
+        self.app: Callable[[dict, Callable, Callable], Coroutine]
+        if isinstance(app, str):
+            self.app = self.load_app(app)
+        else:
+            self.app = app
         self.tls_enabled = False  # TODO: tls support
         self.life_span: LifeSpan = LifeSpan.IDLE
         self.life_span_state = dict()
@@ -101,9 +116,9 @@ class Server:
             **DEFAULT_SCOPE_PARAMS,
         }
         self._addr = (None, None)
-        self.app: Callable[[dict, Callable, Callable], Coroutine]
 
-    def load_app(self, ref_path: str):
+    @classmethod
+    def load_app(cls, ref_path: str) -> Callable:
         _module, _callable = "", ""
         try:
             if ":" in ref_path:
@@ -119,18 +134,24 @@ class Server:
         except:
             raise ValueError(f"Invalid ASGI app identifier: {ref_path}")
         try:
+            sys.path.append(os.getcwd())
             module = importlib.import_module(_module)
         except:
             raise ImportError(f"Error importing module: {_module}")
         try:
             app = getattr(module, _callable)
-            self.app = app
         except:
             raise ImportError(
                 f"Attribute '{_callable}' not found in module '{_module}'"
             )
-        if not callable(self.app):
+        if not callable(app):
             raise ValueError(f"ASGI app is not callable: {ref_path}")
+        return app
+
+    def run(self, id: int = 0):
+        """Start server on an eventloop"""
+        self.id = id
+        asyncio.run(self.start_server())
 
     async def lifespan_recv(self):
         await asyncio.sleep(0)
@@ -159,6 +180,7 @@ class Server:
                 return
 
     async def start_server(self, event_loop: asyncio.AbstractEventLoop | None = None):
+        """Start server"""
         server = await asyncio.start_server(
             self.handle_cli,
             host=self.host,
@@ -349,7 +371,6 @@ class Server:
         return http_recv
 
     def compose_http_send(self, writer: asyncio.StreamWriter, parser_info: ParserInfo):
-        # TODO: might try to reduce the cyclomatic complexity
         _headers = [*DEFAULT_RESPONSE_HEADERS]
         _status = 200
         _trailers = False
@@ -511,15 +532,70 @@ class Server:
                 await writer.wait_closed()
 
 
-if __name__ == "__main__":
-    from sys import argv
-
-    app_ref = argv[-1]
-
-    server = Server(8080)
+def spin_server(app_ref: str, workers: int = 1, host="localhost", port=8075):
+    """Spin server in worker pool"""
     try:
-        server.load_app(app_ref)
+        app = Server.load_app(app_ref)
     except Exception as exp:
         _logger.critical(f"Error loading ASGI app. {exp}")
         exit(2)
-    asyncio.run(server.start_server())
+    server = Server(app, host=host, port=port)
+
+    with multiprocessing.Pool(workers) as pool:
+        try:
+            pool.map(server.run, range(workers))
+        except:
+            _logger.info("Server shutdown complete.")
+
+
+def cli():
+    parser = argparse.ArgumentParser(
+        prog="vanillacorn",
+        description="A simple ASGI server: a basic implementation of the ASGI specification using pure Python and asyncio.",
+        add_help=True,
+        allow_abbrev=True,
+        exit_on_error=True,
+    )
+    parser.add_argument("asgi_app", nargs="?", default=None, help="ASGI app module")
+    parser.add_argument("-v", "--version", action="store_true", help="App version")
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=8075,
+        help="Bind socket to this port (default: 8075)",
+    )
+    parser.add_argument(
+        "-b",
+        "--host",
+        type=str,
+        default="localhost",
+        help="Bind socket to this host. (default: localhost)",
+    )
+    parser.add_argument(
+        "-w", "--workers", type=int, default=1, help="Number of worker processes"
+    )
+
+    args = parser.parse_args()
+
+    if args.version:
+        sys.stdout.write(f"v{__version__}\n")
+        sys.stdout.flush()
+    elif args.asgi_app is None:
+        sys.stderr.write(
+            f"{parser.format_usage()}"
+            f"{parser.prog}: error: argument required: asgi_app"
+        )
+        sys.stdout.flush()
+        exit(1)
+    else:
+        spin_server(
+            args.asgi_app,
+            workers=args.workers,
+            host=args.host,
+            port=args.port,
+        )
+
+
+if __name__ == "__main__":
+    cli()

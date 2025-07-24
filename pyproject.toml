@@ -1,0 +1,35 @@
+[project]
+name = "vanillacorn"
+dynamic = ["version"]
+dependencies = []
+requires-python = ">=3.10"
+authors = [{ name = "bRuttaZz", email = "agrajpdas@gmail.com" }]
+description = "A vanilla ASGI server: a basic implementation of the ASGI specification using pure Python and asyncio."
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "GPL-3.0"
+license-files = ["LICENSE.txt"]
+keywords = ["server", "asgi", "vanilla", "pure python", "simple server"]
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+vanillacorn = "vanillacorn:cli"
+
+[project.entry-points."vanillacorn"]
+vanillacorn = "vanillacorn"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "vanillacorn.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vanillacorn.py"]
+
+[tool.hatch.build.targets.sdist]
