@@ -9,8 +9,11 @@ help:	## Show all Makefile targets.
 version: .required-files ## App version
 	@hatch version
 
-build:	.required-files ## Build package
+build:	.required-files clean ## Build package
 	@hatch build
 
 publish: dist ## Publish build
-	@hatch publish
+	@twine upload dist/*
+
+clean: ## Clean
+	rm -rf dist
