@@ -6,9 +6,12 @@ import importlib
 import logging
 import multiprocessing
 import os
-import sys
 import socket
+import struct
+import sys
+from base64 import b64encode
 from enum import Enum
+from hashlib import sha1
 from itertools import chain
 from sys import stdout, exit
 from typing import Callable, Coroutine, TypedDict, Tuple, Iterable
@@ -31,6 +34,18 @@ class LifeSpan(Enum):
     SHUTDOWN = "shutdown"
     IDLE = "idle"
     READY = "ready"
+
+
+class WSOpcode(Enum):
+    # https://datatracker.ietf.org/doc/html/rfc6455#section-5.5
+    CONTINUE = 0x0
+    TXT = 0x1
+    BYTES = 0x2
+
+    # control codes
+    PING = 0x9
+    PONG = 0xA
+    CLOSE = 0x8
 
 
 class StatusMessages(Enum):
@@ -64,6 +79,10 @@ class ParserInfo(TypedDict):
     req_path: str
     req_addr: str
     req_method: str
+    sec_webSocket_key: str
+    sec_webSocket_version: int
+    header_upgrade: str
+    header_connection: str
 
 
 class ASGISendArg(TypedDict):
@@ -76,6 +95,8 @@ class ASGISendArg(TypedDict):
 
 
 HTTP_VERSIONS = ("1.0", "1.1", "2")
+WS_MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_MAX_PAYLOAD_SIZE_PER_FRAME = 2**16 - 1  # 64kb
 READ_MAX_BYTES = 2**16  # 64kb
 DEFAULT_SCOPE_PARAMS = {
     "asgi": {
@@ -151,6 +172,7 @@ class Server:
         self.id = id
         asyncio.run(self.start_server())
 
+    # lifespan specs
     async def lifespan_recv(self):
         await asyncio.sleep(0)
         return {"type": f"lifespan.{self.life_span.value}"}
@@ -218,6 +240,7 @@ class Server:
                 _logger.info("Application shutdown complete.")
                 _logger.info(f"Finished server process [{self.id}]")
 
+    # parsers
     async def _parse_header_line(
         self, reader: asyncio.StreamReader, spec: dict, parser_info: ParserInfo
     ):
@@ -269,9 +292,18 @@ class Server:
         spec["type"] = ASGIScopeType.HTTP.value
         spec["scheme"] = "https" if self.tls_enabled else "http"
         for key, val in spec["headers"]:
-            if key == b"upgrade" and val == "websocket":
-                spec["type"] = ASGIScopeType.WEBSOCKET.value
-                spec["scheme"] = "wss" if self.tls_enabled else "ws"
+            if key == b"upgrade":
+                _val = val.decode("utf-8").lower()
+                if _val == "websocket":
+                    spec["type"] = ASGIScopeType.WEBSOCKET.value
+                    spec["scheme"] = "wss" if self.tls_enabled else "ws"
+                parser_info["header_upgrade"] = _val
+            elif key == b"connection":
+                parser_info["header_connection"] = val.decode("utf-8").lower()
+            elif key == b"sec-websocket-version":
+                parser_info["sec_webSocket_version"] = int(val)
+            elif key == b"sec-websocket-key":
+                parser_info["sec_webSocket_key"] = val.decode("utf-8")
             elif key == b"sec-websocket-protocol":
                 spec["subprotocols"] = [
                     proto.strip() for proto in val.decode("utf-8").split(",")
@@ -316,6 +348,7 @@ class Server:
         )
         return _found_content_len
 
+    # http specs
     def compose_http_recv(self, reader: asyncio.StreamReader, parser_info: ParserInfo):
         remaining = True
         remaining_len = 0
@@ -478,6 +511,167 @@ class Server:
         writer.close()
         await writer.wait_closed()
 
+    # ws specs
+    async def upgrade_connection(
+        self, writer: asyncio.StreamWriter, parser_info: ParserInfo
+    ) -> bool:
+        """Upgrade http req to websocket ones"""
+        if (
+            not parser_info["sec_webSocket_key"]
+            or not parser_info["sec_webSocket_version"]
+            or parser_info["header_connection"] != "upgrade"
+            or parser_info["header_upgrade"] != "websocket"
+        ):
+            await self.write_errors(writer, 400, parser_info, "Bad Request")
+            return False
+
+        accept_key = b64encode(
+            sha1((parser_info["sec_webSocket_key"] + WS_MAGIC_STRING).encode()).digest()
+        )
+        self._write_response_header(
+            writer,
+            101,
+            parser_info,
+            [
+                *DEFAULT_RESPONSE_HEADERS,
+                (b"Upgrade", b"websocket"),
+                (b"Connection", b"Upgrade"),
+                (b"Sec-WebSocket-Accept", accept_key),
+            ],
+        )
+        writer.write(b"\r\n")
+        await writer.drain()
+
+        return True
+
+    async def _read_ws_frame(
+        self, reader: asyncio.StreamReader
+    ) -> Tuple[int, WSOpcode, bytes]:
+        """
+        WS framing.
+        Spec : https://www.rfc-editor.org/rfc/rfc6455 .
+        Human readable docs : https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers
+
+        parse a frame from the socket and return , FIN, OPCODE and unmasked-payload from the frame
+        """
+        byte1 = ord(await reader.readexactly(1))
+        byte2 = ord(await reader.readexactly(1))
+
+        fin = (byte1 >> 7) & 1  # TODO: fragmentation has to handle if zero more digit
+
+        # ignoring the ws extension handling | Bit 1–3 RSV1, RSV2, RSV3
+
+        try:
+            opcode = WSOpcode(byte1 & 0x0F)
+        except:
+            raise ValueError("Invalid opcode received from frame!")
+
+        masked = (byte2 >> 7) & 1  # bit 8 (masked)
+        if (
+            not masked
+        ):  # according to RFC 6455 section 5.1, reject with status code 1002 for umasked client frames
+            # spec: https://datatracker.ietf.org/doc/html/rfc6455#section-7.4.1
+            # TODO
+            NotImplementedError("Not masked client frame in ws. Should raise 1002")
+
+        # calc length
+        length = byte2 & 0x7F  # bit 9-15
+        if length == 126:
+            length = struct.unpack("!H", await reader.readexactly(2))[
+                0
+            ]  # unsigned short (2 bytes)
+        elif length == 127:
+            length = struct.unpack("!Q", await reader.readexactly(8))[
+                0
+            ]  # unsigned long long (8 bytes)
+
+        mask = await reader.readexactly(4)  # mask key
+        _data = await reader.readexactly(length)
+        unmasked = bytes(b ^ mask[i % 4] for i, b in enumerate(_data))
+
+        return fin, opcode, unmasked
+
+    async def _read_message_fragment(
+        self, reader: asyncio.StreamReader
+    ) -> Tuple[WSOpcode, bytes | str | None]:
+        """Read a message fragment from client"""
+        data: bytes | str = b""
+        opcode: WSOpcode | None = None
+        while True:
+            _fin, _opcode, _data = await self._read_ws_frame(reader)
+
+            if opcode == WSOpcode.TXT or _opcode == WSOpcode.TXT:
+                _data = _data.decode("utf-8")
+
+            if opcode is None:
+                if _opcode == WSOpcode.CONTINUE:
+                    raise ValueError("Initial opcode cannot be 0x0 in ws fragmentaion")
+                opcode = _opcode
+                data = _data
+            else:
+                if _opcode != WSOpcode.CONTINUE:
+                    raise ValueError(
+                        "Non 0x0 opcode found in sequent frame in fragment"
+                    )
+                data += _data  # pyright: ignore[reportOperatorIssue]
+
+            if _fin:  # fin=1 for last message
+                break
+        return opcode, data
+
+    async def _write_ws_frame(
+        self, fin: int, opcode: WSOpcode, payload: bytes, writer: asyncio.StreamWriter
+    ):
+        """Write a ws frame to socket"""
+
+        # First byte: FIN + RSV1–3 (0) + OPCODE
+        byte1 = (fin << 7) | opcode.value
+
+        length = len(payload)
+
+        # Second byte: MASK = 0 for server-to-client
+        if length <= 125:
+            header = struct.pack("!BB", byte1, length)  # uc uc
+        elif length <= 0xFFFF:  # 16-bit extended payload
+            header = struct.pack("!BBH", byte1, 126, length)  # uc uc us
+        else:  # 64-bit extended payload
+            header = struct.pack("!BBQ", byte1, 127, length)  # uc uc ull
+
+        writer.write(header)
+        writer.write(payload)
+        await writer.drain()
+
+    async def _write_message_fragment(
+        self, opcode: WSOpcode, message: bytes, writer: asyncio.StreamWriter
+    ):
+        """Write a message as frame(s) to socket"""
+        while True:
+            msg = b""
+            if len(message) > WS_MAX_PAYLOAD_SIZE_PER_FRAME:
+                msg = message[:WS_MAX_PAYLOAD_SIZE_PER_FRAME]
+                message = message[WS_MAX_PAYLOAD_SIZE_PER_FRAME:]
+            else:
+                msg = message
+                message = b""
+
+            fin = 0 if message else 1
+            await self._write_ws_frame(fin, opcode, msg, writer)
+            if fin:
+                break
+            opcode = WSOpcode.CONTINUE
+
+    def compose_ws_recv(self, reader: asyncio.StreamReader, parser_info: ParserInfo):
+        # TODO
+        async def ws_recv(): ...
+
+        return ws_recv
+
+    def compose_ws_send(self, writer: asyncio.StreamWriter, parser_info: ParserInfo):
+        # TODO
+        async def ws_send(): ...
+
+        return ws_send
+
     async def handle_cli(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
@@ -489,6 +683,10 @@ class Server:
             "req_path": "",
             "req_addr": "",
             "req_method": "",
+            "sec_webSocket_key": "",
+            "sec_webSocket_version": 0,
+            "header_upgrade": "",
+            "header_connection": "",
         }
         try:
             if not await self._parse_header_line(reader, _spec, _parser_info):
@@ -515,8 +713,12 @@ class Server:
                     self.compose_http_send(writer, _parser_info),
                 )
             elif _spec["type"] == ASGIScopeType.WEBSOCKET.value:
-                # TODO
-                ...
+                await self.upgrade_connection(writer, _parser_info)
+                await self.app(
+                    _spec,
+                    self.compose_ws_recv(reader, _parser_info),
+                    self.compose_ws_send(writer, _parser_info),
+                )
             else:
                 NotImplementedError("Websocket recv and send handlers not implemented")
         except Exception as exp:
