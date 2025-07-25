@@ -15,8 +15,6 @@ from typing import Callable, Coroutine, TypedDict, Tuple, Iterable
 from urllib.parse import unquote
 
 _logger = logging.getLogger("pycorn")
-_logger.setLevel(logging.DEBUG)
-_logger.addHandler(logging.StreamHandler(stream=stdout))
 
 ASGI_VERSION = "2.0"  # (2019-03-20)
 SERVER_NAME = "vanillacorn"
@@ -532,6 +530,36 @@ class Server:
                 await writer.wait_closed()
 
 
+def setup_logger(
+    verbose: bool = False, log_file: str | None = None, console_logging: bool = True
+):
+    level = logging.DEBUG if verbose else logging.INFO
+
+    if console_logging:
+        cfmtr = logging.Formatter(
+            "\033[1;96m%(levelname)s:\033[0m \033[1;94m%(asctime)s\033[0m \033[1m[%(process)d]\033[0m %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            validate=True,
+        )
+        ch = logging.StreamHandler(stream=stdout)
+        ch.setFormatter(cfmtr)
+        ch.setLevel(level)
+        _logger.addHandler(ch)
+
+    if log_file:
+        ffmtr = logging.Formatter(
+            "%(levelname)s: %(asctime)s [%(process)d] :: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            validate=True,
+        )
+        fh = logging.FileHandler(filename=log_file)
+        fh.setFormatter(ffmtr)
+        fh.setLevel(level)
+        _logger.addHandler(fh)
+
+    _logger.setLevel(level)
+
+
 def spin_server(app_ref: str, workers: int = 1, host="localhost", port=8075):
     """Spin server in worker pool"""
     try:
@@ -575,13 +603,23 @@ def cli():
     parser.add_argument(
         "-w", "--workers", type=int, default=1, help="Number of worker processes"
     )
+    parser.add_argument(
+        "-s", "--silent", action="store_true", help="Suppress console logging"
+    )
+    parser.add_argument("--verbose", action="store_true", help="Show detailed logging")
+    parser.add_argument(
+        "-l", "--log-file", type=str, default="", help="Write server logs into log file"
+    )
 
     args = parser.parse_args()
 
     if args.version:
         sys.stdout.write(f"v{__version__}\n")
         sys.stdout.flush()
-    elif args.asgi_app is None:
+        exit(0)
+
+    setup_logger(args.verbose, log_file=args.log_file, console_logging=not args.silent)
+    if args.asgi_app is None:
         sys.stderr.write(
             f"{parser.format_usage()}"
             f"{parser.prog}: error: argument required: asgi_app"
