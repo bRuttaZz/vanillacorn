@@ -5,6 +5,7 @@ The system is meant to use zero external libraries and contain in a single file,
 
 # TODO:
 - [ ] support websocket transport
+- [ ] wsgi compatability
 - [ ] test cases
 - [ ] tsl if possible to make it ground simple
 - [ ] readme

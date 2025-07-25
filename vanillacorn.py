@@ -291,6 +291,7 @@ class Server:
     def _parse_info(self, spec: dict, parser_info: ParserInfo):
         spec["type"] = ASGIScopeType.HTTP.value
         spec["scheme"] = "https" if self.tls_enabled else "http"
+        refined_headers = []
         for key, val in spec["headers"]:
             if key == b"upgrade":
                 _val = val.decode("utf-8").lower()
@@ -308,10 +309,14 @@ class Server:
                 spec["subprotocols"] = [
                     proto.strip() for proto in val.decode("utf-8").split(",")
                 ]
+                refined_headers.append((b"subprotocol", val))
+                continue
             elif key == b"content-length":
                 parser_info["content_length"] = val.decode("utf-8")
             elif key == b"transfer-encoding" and val == b"chunked":
                 parser_info["chunked_encoding"] = True
+            refined_headers.append((key, val))
+        spec["headers"] = refined_headers
         parser_info["req_method"] = spec["method"]
         parser_info["req_path"] = spec["path"]
 
