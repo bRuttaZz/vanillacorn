@@ -14,7 +14,8 @@ from enum import Enum
 from hashlib import sha1
 from itertools import chain
 from sys import stdout, exit
-from typing import Callable, Coroutine, TypedDict, Tuple, Iterable
+from time import time
+from typing import Callable, Coroutine, TypedDict, Tuple, Iterable, Literal
 from urllib.parse import unquote
 
 _logger = logging.getLogger("pycorn")
@@ -94,9 +95,47 @@ class ASGISendArg(TypedDict):
     more_body: bool
 
 
+class WSASGISendArg(TypedDict):
+    type: str
+    subprotocol: str
+    headers: Iterable[Tuple[bytes, bytes]]
+    bytes: bytes
+    text: str
+    code: int
+    reason: str
+
+
+class WSASGIMsg(TypedDict):
+    type: Literal["websocket.receive", "websocket.send", "websocket.connect"]
+    bytes: bytes | None
+    text: str | None
+
+
+class WSConnParams(TypedDict):
+    recv_queue: asyncio.Queue
+    sock_closing: bool
+    sock_connected: bool
+    _closing_from: Literal["server", "client"] | None
+    _closing_reason: str | None
+    _closing_code: int | None
+    _last_active: float
+    _last_ping_send: float
+    _last_pong: float
+
+
 HTTP_VERSIONS = ("1.0", "1.1", "2")
+
 WS_MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_MAX_PAYLOAD_SIZE_PER_FRAME = 2**16 - 1  # 64kb
+WS_MAX_LAST_ACTIVE_TIME = 60  # seconds
+WS_MAX_PING_RESPONSE_TIME = 10  # seconds
+WS_PING_INTERVEL = 30  # seconds
+
+# TODO: implement limits
+WS_MAX_READ_LIMIT_FRAME = 5 * 100 * 100  # 1mb
+WS_MAX_READ_LIMIT_MESSAGE = 10 * WS_MAX_READ_LIMIT_FRAME
+WS_MAX_READ_LIMIT_MESSAGE_BUFFER = 10 * WS_MAX_READ_LIMIT_MESSAGE
+
 READ_MAX_BYTES = 2**16  # 64kb
 DEFAULT_SCOPE_PARAMS = {
     "asgi": {
@@ -106,8 +145,10 @@ DEFAULT_SCOPE_PARAMS = {
 }
 DEFAULT_RESPONSE_HEADERS = [(b"Server", SERVER_NAME.encode("ascii"))]
 
-# TODO:
-# Exception handling
+
+# Exceptions
+class _OSError(OSError):
+    """Vaillacorn Custom OSError"""
 
 
 class Server:
@@ -366,37 +407,42 @@ class Server:
             nonlocal remaining, remaining_len
             payload = b""
 
-            if not remaining:
-                pass
+            try:
+                if not remaining:
+                    pass
 
-            elif parser_info[
-                "chunked_encoding"
-            ]:  # read type: transfer-encoding: chunked
-                size_line = await reader.readline()
-                if not size_line:
-                    remaining = False
-                chunk_size = int(
-                    size_line.strip(), 16
-                )  # TODO: possible conversion error
-                if not chunk_size:
-                    await reader.readline()  # for trailing CRLF
-                    remaining = False
-                payload = await reader.readexactly(chunk_size)
-                await reader.readline()  # again for trailing CRLF
+                elif parser_info[
+                    "chunked_encoding"
+                ]:  # read type: transfer-encoding: chunked
+                    size_line = await reader.readline()
+                    if not size_line:
+                        remaining = False
+                    chunk_size = int(size_line.strip(), 16)
+                    if not chunk_size:
+                        await reader.readline()  # for trailing CRLF
+                        remaining = False
+                    payload = await reader.readexactly(chunk_size)
+                    await reader.readline()  # again for trailing CRLF
 
-            elif fixed_content:  # read fixed fixed_content
-                _len = (
-                    READ_MAX_BYTES if remaining_len > READ_MAX_BYTES else remaining_len
-                )
-                payload = await reader.read(_len)
-                remaining_len -= _len
-                if not remaining_len:
-                    remaining = False
+                elif fixed_content:  # read fixed fixed_content
+                    _len = (
+                        READ_MAX_BYTES
+                        if remaining_len > READ_MAX_BYTES
+                        else remaining_len
+                    )
+                    payload = await reader.read(_len)
+                    remaining_len -= _len
+                    if not remaining_len:
+                        remaining = False
 
-            else:  # read all till null
-                payload = await reader.read(READ_MAX_BYTES)
-                if not payload:
-                    remaining = False
+                else:  # read all till null
+                    payload = await reader.read(READ_MAX_BYTES)
+                    if not payload:
+                        remaining = False
+            except Exception as exp:
+                _logger.debug(f"Error reading from server: {exp}")
+                _logger.warning("Error reading from server.")
+                raise _OSError("Client Error: Error reading from server!")
 
             return {
                 "type": "http.request",
@@ -416,7 +462,7 @@ class Server:
 
         async def http_send(msg: ASGISendArg):
             if writer.is_closing():
-                raise OSError(
+                raise _OSError(
                     "[pycorn] Attempt to write on a closed client-connection!"
                 )
 
@@ -491,7 +537,7 @@ class Server:
         message: str = "",
     ):
         if writer.is_closing():
-            raise OSError("[pycorn] Attempt to write on a closed client-connection!")
+            raise _OSError("[pycorn] Attempt to write on a closed client-connection!")
 
         if not message:
             if f"status_{status}" in StatusMessages.__members__:
@@ -517,10 +563,10 @@ class Server:
         await writer.wait_closed()
 
     # ws specs
-    async def upgrade_connection(
+    async def _validate_ws_req(
         self, writer: asyncio.StreamWriter, parser_info: ParserInfo
     ) -> bool:
-        """Upgrade http req to websocket ones"""
+        """Validate ws connection req"""
         if (
             not parser_info["sec_webSocket_key"]
             or not parser_info["sec_webSocket_version"]
@@ -529,7 +575,14 @@ class Server:
         ):
             await self.write_errors(writer, 400, parser_info, "Bad Request")
             return False
+        return True
 
+    async def _upgrade_ws_conn(
+        self,
+        writer: asyncio.StreamWriter,
+        parser_info: ParserInfo,
+        headers: Iterable[Tuple[bytes, bytes]],
+    ):
         accept_key = b64encode(
             sha1((parser_info["sec_webSocket_key"] + WS_MAGIC_STRING).encode()).digest()
         )
@@ -544,10 +597,18 @@ class Server:
                 (b"Sec-WebSocket-Accept", accept_key),
             ],
         )
+        for key, val in headers:
+            if key == b"subprotocol":
+                continue
+            if key.decode("utf-8").lower() not in [
+                "upgrade",
+                "connection",
+                "sec-websocket-accept",
+                "sec-websocket-protocol",
+            ]:
+                writer.write(key + b": " + val + b"\r\n")
         writer.write(b"\r\n")
         await writer.drain()
-
-        return True
 
     async def _read_ws_frame(
         self, reader: asyncio.StreamReader
@@ -562,7 +623,7 @@ class Server:
         byte1 = ord(await reader.readexactly(1))
         byte2 = ord(await reader.readexactly(1))
 
-        fin = (byte1 >> 7) & 1  # TODO: fragmentation has to handle if zero more digit
+        fin = (byte1 >> 7) & 1
 
         # ignoring the ws extension handling | Bit 1–3 RSV1, RSV2, RSV3
 
@@ -598,15 +659,12 @@ class Server:
 
     async def _read_message_fragment(
         self, reader: asyncio.StreamReader
-    ) -> Tuple[WSOpcode, bytes | str | None]:
+    ) -> Tuple[WSOpcode, bytes | str]:
         """Read a message fragment from client"""
-        data: bytes | str = b""
+        data: bytes = b""
         opcode: WSOpcode | None = None
         while True:
             _fin, _opcode, _data = await self._read_ws_frame(reader)
-
-            if opcode == WSOpcode.TXT or _opcode == WSOpcode.TXT:
-                _data = _data.decode("utf-8")
 
             if opcode is None:
                 if _opcode == WSOpcode.CONTINUE:
@@ -622,6 +680,9 @@ class Server:
 
             if _fin:  # fin=1 for last message
                 break
+
+        if opcode == WSOpcode.TXT:
+            return opcode, data.decode("utf-8")
         return opcode, data
 
     async def _write_ws_frame(
@@ -665,15 +726,126 @@ class Server:
                 break
             opcode = WSOpcode.CONTINUE
 
-    def compose_ws_recv(self, reader: asyncio.StreamReader, parser_info: ParserInfo):
-        # TODO
-        async def ws_recv(): ...
+    async def ws_conn_listener(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        ws_conn_info: WSConnParams,
+    ):
+        """Responsible for handling control codes"""
+        while True:
+            await asyncio.sleep(0)
+
+            if writer.is_closing():  # TODO
+                break
+
+            time_now = time()
+
+            # check timeouts
+            if time_now - ws_conn_info["_last_active"] > WS_MAX_LAST_ACTIVE_TIME or (
+                ws_conn_info["_last_ping_send"]
+                and time_now - ws_conn_info["_last_ping_send"]
+                > WS_MAX_PING_RESPONSE_TIME
+            ):
+                # TODO
+                raise NotImplementedError("Raise inactive for long time error")
+
+            # send ping
+            if time_now - ws_conn_info["_last_pong"] > WS_PING_INTERVEL:
+                await self._write_ws_frame(1, WSOpcode.PING, b"vanillacorn", writer)
+                ws_conn_info["_last_ping_send"] = time()
+
+            try:
+                opcode, data = await self._read_message_fragment(reader)
+                ws_conn_info["_last_active"] = time()
+            except ValueError:
+                # TODO
+                raise NotImplementedError("has to send ws status frame")
+
+            match opcode:
+                case WSOpcode.TXT | WSOpcode.BYTES:
+                    await ws_conn_info["recv_queue"].put(
+                        WSASGIMsg(
+                            type="websocket.receive",
+                            text=(
+                                data if opcode == WSOpcode.TXT else None
+                            ),  # pyright: ignore[reportArgumentType]
+                            bytes=(
+                                data if opcode == WSOpcode.BYTES else None
+                            ),  # pyright: ignore[reportArgumentType]
+                        )
+                    )
+                case WSOpcode.CLOSE:
+                    # TODO: closing handshake
+                    ...
+                case WSOpcode.PING:
+                    await self._write_ws_frame(
+                        1, WSOpcode.PONG, data, writer
+                    )  # pyright: ignore[reportArgumentType]
+                    ws_conn_info["_last_pong"] = time()
+                case WSOpcode.PONG:
+                    ws_conn_info["_last_ping_send"] = 0
+                    ws_conn_info["_last_pong"] = time()
+                case _:
+                    raise NotImplementedError("Invalid opcode in ws_conn_listener")
+
+    def compose_ws_recv(
+        self,
+        reader: asyncio.StreamReader,
+        parser_info: ParserInfo,
+        ws_conn_info: WSConnParams,
+    ):
+        async def ws_recv():
+            if not ws_conn_info["sock_connected"]:
+                return WSASGIMsg(type="websocket.connect", text=None, bytes=None)
+            return await ws_conn_info["recv_queue"].get()
 
         return ws_recv
 
-    def compose_ws_send(self, writer: asyncio.StreamWriter, parser_info: ParserInfo):
-        # TODO
-        async def ws_send(): ...
+    def compose_ws_send(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        parser_info: ParserInfo,
+        ws_conn_info: WSConnParams,
+    ):
+        async def ws_send(msg: WSASGISendArg):
+            if writer.is_closing() or ws_conn_info["sock_closing"]:
+                raise _OSError("Socket closed!")
+
+            elif msg["type"] == "websocket.accept":
+                # ignoring ws subprotocol from msg["subprotocol"]
+                await self._upgrade_ws_conn(writer, parser_info, msg.get("headers", []))
+                _now = time()
+                ws_conn_info["sock_connected"] = True
+                ws_conn_info["_last_active"] = _now
+                ws_conn_info["_last_ping_send"] = 0
+                ws_conn_info["_last_pong"] = _now
+                asyncio.create_task(self.ws_conn_listener(reader, writer, ws_conn_info))
+
+            elif (
+                msg["type"] == "websocket.close" and not ws_conn_info["sock_connected"]
+            ):
+                await self.write_errors(writer, 403, parser_info)
+                ws_conn_info["sock_closing"] = True
+
+            elif msg["type"] == "websocket.close":
+                # TODO
+                ...
+
+            elif msg["type"] == "websocket.send":
+                if msg.get("text") is not None:
+                    await self._write_message_fragment(
+                        WSOpcode.TXT, msg["text"].encode("utf-8"), writer
+                    )
+                elif msg.get("bytes") is not None:
+                    await self._write_message_fragment(
+                        WSOpcode.BYTES, msg["bytes"], writer
+                    )
+                else:
+                    raise ValueError(
+                        "send type='websocket.send' should contain either 'text' or 'bytes'"
+                    )
 
         return ws_send
 
@@ -718,14 +890,32 @@ class Server:
                     self.compose_http_send(writer, _parser_info),
                 )
             elif _spec["type"] == ASGIScopeType.WEBSOCKET.value:
-                await self.upgrade_connection(writer, _parser_info)
-                await self.app(
-                    _spec,
-                    self.compose_ws_recv(reader, _parser_info),
-                    self.compose_ws_send(writer, _parser_info),
-                )
+                if await self._validate_ws_req(writer, _parser_info):
+                    _ws_conn_info: WSConnParams = {
+                        "recv_queue": asyncio.Queue(),
+                        "sock_closing": False,
+                        "sock_connected": False,
+                        "_closing_from": None,
+                        "_closing_reason": None,
+                        "_closing_code": None,
+                        "_last_active": 0,
+                        "_last_ping_send": 0,
+                        "_last_pong": 0,
+                    }
+                    await self.app(
+                        _spec,
+                        self.compose_ws_recv(reader, _parser_info, _ws_conn_info),
+                        self.compose_ws_send(
+                            reader, writer, _parser_info, _ws_conn_info
+                        ),
+                    )
             else:
-                NotImplementedError("Websocket recv and send handlers not implemented")
+                NotImplementedError(
+                    f"Invalid asgi scope! scope['type']={_spec['type']}"
+                )
+        except _OSError:
+            # as per asgi spec 2.4 no error logs to be created!
+            ...
         except Exception as exp:
             _logger.exception(exp)
             _logger.error(f"ASGI applicatoin error on handling request: {exp}")

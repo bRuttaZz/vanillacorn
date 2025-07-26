@@ -6,6 +6,11 @@ The system is meant to use zero external libraries and contain in a single file,
 # TODO:
 - [ ] support websocket transport
 - [ ] wsgi compatability
+- [ ] implement http/ws read and buffering limits
 - [ ] test cases
 - [ ] tsl if possible to make it ground simple
 - [ ] readme
+
+
+## Caveats
+- currently ignoring ws subprotocols and ws extensions
