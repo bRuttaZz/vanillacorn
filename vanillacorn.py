@@ -16,7 +16,17 @@ from hashlib import sha1
 from itertools import chain
 from sys import stdout, exit
 from time import time
-from typing import Callable, Coroutine, TypedDict, Tuple, Iterable, Literal, NotRequired
+from typing import (
+    Callable,
+    Coroutine,
+    TypedDict,
+    Tuple,
+    Iterable,
+    Literal,
+    NotRequired,
+    Optional,
+    Awaitable,
+)
 from urllib.parse import unquote
 
 _logger = logging.getLogger("pycorn")
@@ -25,12 +35,6 @@ ASGI_VERSION = (
     "2.5"  # https://asgi.readthedocs.io/en/latest/specs/www.html#spec-versions
 )
 SERVER_NAME = "vanillacorn"
-
-
-class ASGIScopeType(Enum):
-    LIFESPAN = "lifespan"
-    HTTP = "http"
-    WEBSOCKET = "websocket"
 
 
 class LifeSpan(Enum):
@@ -50,6 +54,12 @@ class WSOpcode(Enum):
     PING = 0x9
     PONG = 0xA
     CLOSE = 0x8
+
+
+class ASGIScopeType(str, Enum):
+    LIFESPAN = "lifespan"
+    HTTP = "http"
+    WEBSOCKET = "websocket"
 
 
 class StatusMessages(Enum):
@@ -89,19 +99,6 @@ class WSStatusMessages(Enum):
     status_1011 = "Unexpected error"
 
 
-class ParserInfo(TypedDict):
-    content_length: str | int
-    chunked_encoding: bool
-    http_version_str: str
-    req_path: str
-    req_addr: str
-    req_method: str
-    sec_webSocket_key: str
-    sec_webSocket_version: int
-    header_upgrade: str
-    header_connection: str
-
-
 class ASGISendArg(TypedDict):
     type: str
     status: NotRequired[int]
@@ -134,15 +131,24 @@ class WSASGIMsg(TypedDict):
     reason: NotRequired[str | None]
 
 
-class WSConnParams(TypedDict):
-    recv_queue: asyncio.Queue
-    sock_connected: bool
-    _closing_reason: str | None
-    _closing_code: int | None
-    _last_active: float
-    _last_ping_send: float
-    _last_pong: float
-    listen_task: asyncio.Task | None
+class ASGIScopeBase(TypedDict):
+    type: ASGIScopeType | None
+    asgi: dict
+    state: dict | None
+
+
+class ASGIScope(ASGIScopeBase):
+    http_version: Literal["1.0", "1.1", "2"] | None
+    method: str
+    scheme: Literal["http", "https", "ws", "wss"] | None
+    path: str
+    raw_path: bytes
+    query_string: bytes
+    root_path: str
+    headers: Iterable[Tuple[bytes, bytes]] | None
+    client: Tuple[str, int] | None
+    server: Tuple | None
+    subprotocols: Iterable[str] | None
 
 
 HTTP_VERSIONS = ("1.0", "1.1", "2")
@@ -179,12 +185,56 @@ class _OSError(OSError):
     """Vaillacorn Custom OSError"""
 
 
+class SockObj:
+    def __init__(self, writer: asyncio.StreamWriter, reader: asyncio.StreamReader):
+        self.writer = writer
+        self.reader = reader
+
+        self.scope: ASGIScope = {
+            "type": None,
+            "asgi": {
+                **DEFAULT_SCOPE_PARAMS["asgi"],
+            },
+            "http_version": None,
+            "method": "",
+            "scheme": None,
+            "path": "",
+            "raw_path": b"",
+            "query_string": b"",
+            "root_path": "",
+            "headers": None,
+            "client": None,
+            "server": None,
+            "subprotocols": None,
+            "state": None,
+        }
+
+        self.content_length: int | None = None
+        self.chunked_encoding: bool = False
+        self.req_addr: str = ""
+        self.http_version_str: str = ""
+        self.sec_webSocket_key: str = ""
+        self.sec_webSocket_version: int = 0
+        self.header_upgrade: str = ""
+        self.header_connection: str = ""
+
+        # ws specific
+        self.recv_queue = asyncio.Queue()
+        self.sock_connected: bool = False
+        self.listen_task: asyncio.Task | None = None
+        self._closing_reason: str | None = None
+        self._closing_code: int | None = None
+        self._last_active: float = 0
+        self._last_ping_send: float = 0
+        self._last_pong: float = 0
+
+
 class Server:
     _asgi_version = ASGI_VERSION
 
     def __init__(
         self,
-        app: Callable[[dict, Callable, Callable], Coroutine] | str,
+        app: Callable[[ASGIScopeBase | ASGIScope, Callable, Callable], Coroutine] | str,
         port: int = 8075,
         host: str = "localhost",
         ssl_key: str = "",
@@ -195,7 +245,6 @@ class Server:
         self.host: str = host
         self.port: int = port
 
-        self.app: Callable[[dict, Callable, Callable], Coroutine]
         if isinstance(app, str):
             self.app = self.load_app(app)
         else:
@@ -208,10 +257,6 @@ class Server:
 
         self.life_span: LifeSpan = LifeSpan.IDLE
         self.life_span_state = dict()
-        self._common_scopes = {
-            "state": self.life_span_state,
-            **DEFAULT_SCOPE_PARAMS,
-        }
         self._addr = (None, None)
 
     @classmethod
@@ -307,7 +352,13 @@ class Server:
             _logger.info("Waiting for application startup.")
             asyncio.create_task(
                 self.app(
-                    {"type": ASGIScopeType.LIFESPAN.value, **self._common_scopes},
+                    ASGIScopeBase(
+                        type=ASGIScopeType.LIFESPAN,
+                        asgi={
+                            **DEFAULT_SCOPE_PARAMS["asgi"],
+                        },
+                        state=self.life_span_state,
+                    ),
                     self.lifespan_recv,
                     self.lifespan_send,
                 )
@@ -331,11 +382,9 @@ class Server:
                 _logger.info(f"Finished server process [{self.id}]")
 
     # parsers
-    async def _parse_header_line(
-        self, reader: asyncio.StreamReader, spec: dict, parser_info: ParserInfo
-    ):
+    async def _parse_header_line(self, sock_obj: SockObj):
         # as of now not respecting any pseudo headers
-        header_line = await reader.readline()
+        header_line = await sock_obj.reader.readline()
         header_line = header_line.decode("ascii").strip().rstrip("\r")
         header_line_comps = header_line.split(" ")
         if len(header_line_comps) != 3:
@@ -345,16 +394,16 @@ class Server:
         if http_version not in HTTP_VERSIONS:
             _logger.debug("Invalid http protocol!")
             return
-        parser_info["http_version_str"] = header_line_comps[2].upper()
-        spec["method"] = header_line_comps[0].upper()
-        spec["http_version"] = http_version
-        spec["path"] = header_line_comps[1]
+        sock_obj.http_version_str = header_line_comps[2].upper()
+        sock_obj.scope["method"] = header_line_comps[0].upper()
+        sock_obj.scope["http_version"] = http_version
+        sock_obj.scope["path"] = header_line_comps[1]
         return True
 
-    async def _parse_headers(self, reader: asyncio.StreamReader, spec: dict):
+    async def _parse_headers(self, sock_obj: SockObj):
         _headers = []
         while True:
-            line = await reader.readline()
+            line = await sock_obj.reader.readline()
             line = line.decode("ascii").strip().rstrip("\r")
             if not line:
                 break
@@ -365,69 +414,66 @@ class Server:
                     _headers.insert(0, (b"host", h_val.encode("utf-8")))
                 continue  # ignore all pseudo headers as per spec : https://asgi.readthedocs.io/en/latest/specs/www.html
             _headers.append((h_key.lower().encode("utf-8"), h_val.encode("utf-8")))
-        spec["headers"] = tuple(_headers)
+        sock_obj.scope["headers"] = tuple(_headers)
         return True
 
-    def _parse_pathname(self, spec: dict):
-        org_path = spec.get("path", "/")
+    def _parse_pathname(self, sock_obj: SockObj):
+        org_path = sock_obj.scope["path"]
         path, *query = org_path.split("?")
         query = "?".join(query)
 
-        spec["path"] = unquote(path)
-        spec["query_string"] = query.encode("utf-8")
-        spec["raw_path"] = path.encode("utf-8")
-        spec["root_path"] = ""
+        sock_obj.scope["path"] = unquote(path)
+        sock_obj.scope["query_string"] = query.encode("utf-8")
+        sock_obj.scope["raw_path"] = path.encode("utf-8")
+        sock_obj.scope["root_path"] = ""
 
-    def _parse_info(self, spec: dict, parser_info: ParserInfo):
-        spec["type"] = ASGIScopeType.HTTP.value
-        spec["scheme"] = "https" if self.tls_enabled else "http"
+    def _parse_info(self, sock_obj: SockObj):
+        sock_obj.scope["type"] = ASGIScopeType.HTTP
+        sock_obj.scope["scheme"] = "https" if self.tls_enabled else "http"
+
+        if not sock_obj.scope["headers"]:
+            raise RuntimeError("headers appear as None in _parse_info")
         refined_headers = []
-        for key, val in spec["headers"]:
+        for key, val in sock_obj.scope["headers"]:
             if key == b"upgrade":
                 _val = val.decode("utf-8").lower()
                 if _val == "websocket":
-                    spec["type"] = ASGIScopeType.WEBSOCKET.value
-                    spec["scheme"] = "wss" if self.tls_enabled else "ws"
-                parser_info["header_upgrade"] = _val
+                    sock_obj.scope["type"] = ASGIScopeType.WEBSOCKET
+                    sock_obj.scope["scheme"] = "wss" if self.tls_enabled else "ws"
+                sock_obj.header_upgrade = _val
             elif key == b"connection":
-                parser_info["header_connection"] = val.decode("utf-8").lower()
+                sock_obj.header_connection = val.decode("utf-8").lower()
             elif key == b"sec-websocket-version":
-                parser_info["sec_webSocket_version"] = int(val)
+                sock_obj.sec_webSocket_version = int(val)
             elif key == b"sec-websocket-key":
-                parser_info["sec_webSocket_key"] = val.decode("utf-8")
+                sock_obj.sec_webSocket_key = val.decode("utf-8")
             elif key == b"sec-websocket-protocol":
-                spec["subprotocols"] = [
+                sock_obj.scope["subprotocols"] = [
                     proto.strip() for proto in val.decode("utf-8").split(",")
                 ]
                 refined_headers.append((b"subprotocol", val))
                 continue
             elif key == b"content-length":
-                parser_info["content_length"] = val.decode("utf-8")
+                sock_obj.content_length = int(val)
             elif key == b"transfer-encoding" and val == b"chunked":
-                parser_info["chunked_encoding"] = True
+                sock_obj.chunked_encoding = True
             refined_headers.append((key, val))
-        spec["headers"] = refined_headers
-        parser_info["req_method"] = spec["method"]
-        parser_info["req_path"] = spec["path"]
+        sock_obj.scope["headers"] = refined_headers
 
-    async def _parse_scope(
-        self, reader: asyncio.StreamReader, _spec: dict, _parser_info: ParserInfo
-    ):
-        if not await self._parse_header_line(reader, _spec, _parser_info):
+    async def _parse_scope(self, sock_obj: SockObj):
+        if not await self._parse_header_line(sock_obj):
             raise ValueError("parserError in headerline")
-        if not await self._parse_headers(reader, _spec):
+        if not await self._parse_headers(sock_obj):
             raise ValueError("parserError in headerline")
-        self._parse_pathname(_spec)
-        self._parse_info(_spec, _parser_info)
-        _spec["server"] = self._addr
-        _spec["state"] = self.life_span_state
-        _parser_info["req_addr"] = _spec["client"][0]
+        self._parse_pathname(sock_obj)
+        self._parse_info(sock_obj)
+        sock_obj.scope["server"] = self._addr
+        sock_obj.scope["state"] = self.life_span_state
 
     def _write_response_header(
         self,
-        writer: asyncio.StreamWriter,
+        sock_obj: SockObj,
         status: int,
-        parser_info: ParserInfo,
         headers: Iterable[Tuple[bytes, bytes]],
         content_len: int | None = None,
     ) -> bool:
@@ -436,33 +482,31 @@ class Server:
         if f"status_{status}" in StatusMessages.__members__:
             msg = StatusMessages[f"status_{status}"]
 
-        writer.write(
-            (f"{parser_info['http_version_str']} {status} {msg.value}\r\n").encode(
-                "ascii"
-            )
+        sock_obj.writer.write(
+            (f"{sock_obj.http_version_str} {status} {msg.value}\r\n").encode("ascii")
         )
 
         for key, val in headers:
             if key.decode("utf-8").lower() == "content-length":
                 _found_content_len = True
-            writer.write(key + b": " + val + b"\r\n")
+            sock_obj.writer.write(key + b": " + val + b"\r\n")
 
         if not _found_content_len and content_len is not None:
-            writer.write(f"Content-Length: {content_len}\r\n".encode("ascii"))
+            sock_obj.writer.write(f"Content-Length: {content_len}\r\n".encode("ascii"))
         _logger.info(
-            f"{parser_info['req_addr']} - "
-            f"\"{parser_info['req_method'].upper()} {parser_info['req_path']} {parser_info['http_version_str']}\" "
+            f"{sock_obj.req_addr} - "
+            f"\"{sock_obj.scope['method'].upper()} {sock_obj.scope['path']} {sock_obj.http_version_str}\" "
             f"- {status} {msg.value}"
         )
         return _found_content_len
 
     # http specs
-    def compose_http_recv(self, reader: asyncio.StreamReader, parser_info: ParserInfo):
-        remaining = True
-        remaining_len = 0
-        fixed_content = False
-        if str(parser_info["content_length"]).isdigit():
-            remaining_len = int(parser_info["content_length"])
+    def compose_http_recv(self, sock_obj: SockObj):
+        remaining: bool = True
+        remaining_len: int = 0
+        fixed_content: bool = False
+        if sock_obj.content_length is not None:
+            remaining_len = sock_obj.content_length
             fixed_content = True
 
         async def http_recv(*args, **kwargs):
@@ -473,18 +517,16 @@ class Server:
                 if not remaining:
                     pass
 
-                elif parser_info[
-                    "chunked_encoding"
-                ]:  # read type: transfer-encoding: chunked
-                    size_line = await reader.readline()
+                elif sock_obj.chunked_encoding:  # read type: transfer-encoding: chunked
+                    size_line = await sock_obj.reader.readline()
                     if not size_line:
                         remaining = False
                     chunk_size = int(size_line.strip(), 16)
                     if not chunk_size:
-                        await reader.readline()  # for trailing CRLF
+                        await sock_obj.reader.readline()  # for trailing CRLF
                         remaining = False
-                    payload = await reader.readexactly(chunk_size)
-                    await reader.readline()  # again for trailing CRLF
+                    payload = await sock_obj.reader.readexactly(chunk_size)
+                    await sock_obj.reader.readline()  # again for trailing CRLF
 
                 elif fixed_content:  # read fixed fixed_content
                     _len = (
@@ -492,13 +534,13 @@ class Server:
                         if remaining_len > READ_MAX_BYTES
                         else remaining_len
                     )
-                    payload = await reader.read(_len)
+                    payload = await sock_obj.reader.read(_len)
                     remaining_len -= _len
                     if not remaining_len:
                         remaining = False
 
                 else:  # read all till null
-                    payload = await reader.read(READ_MAX_BYTES)
+                    payload = await sock_obj.reader.read(READ_MAX_BYTES)
                     if not payload:
                         remaining = False
             except Exception as exp:
@@ -514,7 +556,7 @@ class Server:
 
         return http_recv
 
-    def compose_http_send(self, writer: asyncio.StreamWriter, parser_info: ParserInfo):
+    def compose_http_send(self, sock_obj: SockObj):
         _headers = [*DEFAULT_RESPONSE_HEADERS]
         _status = 200
         _trailers = False
@@ -523,7 +565,7 @@ class Server:
         _chunked_encoding = False
 
         async def http_send(msg: ASGISendArg):
-            if writer.is_closing():
+            if sock_obj.writer.is_closing():
                 raise _OSError(
                     "[pycorn] Attempt to write on a closed client-connection!"
                 )
@@ -547,42 +589,38 @@ class Server:
                     _body.extend(body)
                     return
                 if not _header_send:
-                    if not self._write_response_header(
-                        writer, _status, parser_info, _headers
-                    ):
+                    if not self._write_response_header(sock_obj, _status, _headers):
                         if not more_body:
-                            writer.write(
+                            sock_obj.writer.write(
                                 f"Content-Length: {len(body)}\r\n".encode("ascii")
                             )
                         else:
                             _chunked_encoding = True
-                            writer.write(
+                            sock_obj.writer.write(
                                 "Transfer-Encoding: chunked\r\n".encode("ascii")
                             )
-                    writer.write(b"\r\n")
+                    sock_obj.writer.write(b"\r\n")
                     _header_send = True
                 if _chunked_encoding:
                     size_line = f"{len(body):X}\r\n".encode("ascii")  # size in hex
-                    writer.write(size_line)
-                    writer.write(body + b"\r\n")
+                    sock_obj.writer.write(size_line)
+                    sock_obj.writer.write(body + b"\r\n")
                 else:
-                    writer.write(body)
-                await writer.drain()
+                    sock_obj.writer.write(body)
+                await sock_obj.writer.drain()
                 if not more_body:
-                    writer.close()
-                    await writer.wait_closed()
+                    sock_obj.writer.close()
+                    await sock_obj.writer.wait_closed()
 
             elif type == "http.response.trailers":
                 _body.extend(body)
                 t_body = bytes(_body)
-                self._write_response_header(
-                    writer, _status, parser_info, _headers, len(t_body)
-                )
-                writer.write(b"\r\n")
-                writer.write(t_body)
-                await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                self._write_response_header(sock_obj, _status, _headers, len(t_body))
+                sock_obj.writer.write(b"\r\n")
+                sock_obj.writer.write(t_body)
+                await sock_obj.writer.drain()
+                sock_obj.writer.close()
+                await sock_obj.writer.wait_closed()
 
             else:
                 raise NotImplementedError(
@@ -591,14 +629,8 @@ class Server:
 
         return http_send
 
-    async def write_errors(
-        self,
-        writer: asyncio.StreamWriter,
-        status: int,
-        _parser_info: ParserInfo,
-        message: str = "",
-    ):
-        if writer.is_closing():
+    async def write_errors(self, sock_obj: SockObj, status: int, message: str = ""):
+        if sock_obj.writer.is_closing():
             raise _OSError("[pycorn] Attempt to write on a closed client-connection!")
 
         if not message:
@@ -609,49 +641,44 @@ class Server:
         msg = message.encode("ascii")
 
         self._write_response_header(
-            writer,
+            sock_obj,
             status,
-            _parser_info,
             [
                 *DEFAULT_RESPONSE_HEADERS,
                 (b"Content-Type", b"text/plain"),
             ],
             content_len=len(msg),
         )
-        writer.write(b"\r\n")
-        writer.write(msg)
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        sock_obj.writer.write(b"\r\n")
+        sock_obj.writer.write(msg)
+        await sock_obj.writer.drain()
+        sock_obj.writer.close()
+        await sock_obj.writer.wait_closed()
 
     # ws specs
-    async def _validate_ws_req(
-        self, writer: asyncio.StreamWriter, parser_info: ParserInfo
-    ) -> bool:
+    async def _validate_ws_req(self, sock_obj: SockObj) -> bool:
         """Validate ws connection req"""
         if (
-            not parser_info["sec_webSocket_key"]
-            or not parser_info["sec_webSocket_version"]
-            or parser_info["header_connection"] != "upgrade"
-            or parser_info["header_upgrade"] != "websocket"
+            not sock_obj.sec_webSocket_key
+            or not sock_obj.sec_webSocket_version
+            or sock_obj.header_connection != "upgrade"
+            or sock_obj.header_upgrade != "websocket"
         ):
-            await self.write_errors(writer, 400, parser_info, "Bad Request")
+            await self.write_errors(sock_obj, 400, "Bad Request")
             return False
         return True
 
     async def _upgrade_ws_conn(
         self,
-        writer: asyncio.StreamWriter,
-        parser_info: ParserInfo,
+        sock_obj: SockObj,
         headers: Iterable[Tuple[bytes, bytes]],
     ):
         accept_key = b64encode(
-            sha1((parser_info["sec_webSocket_key"] + WS_MAGIC_STRING).encode()).digest()
+            sha1((sock_obj.sec_webSocket_key + WS_MAGIC_STRING).encode()).digest()
         )
         self._write_response_header(
-            writer,
+            sock_obj,
             101,
-            parser_info,
             [
                 *DEFAULT_RESPONSE_HEADERS,
                 (b"Upgrade", b"websocket"),
@@ -668,9 +695,9 @@ class Server:
                 "sec-websocket-accept",
                 "sec-websocket-protocol",
             ]:
-                writer.write(key + b": " + val + b"\r\n")
-        writer.write(b"\r\n")
-        await writer.drain()
+                sock_obj.writer.write(key + b": " + val + b"\r\n")
+        sock_obj.writer.write(b"\r\n")
+        await sock_obj.writer.drain()
 
     async def _read_ws_frame(
         self, reader: asyncio.StreamReader
@@ -785,10 +812,7 @@ class Server:
             opcode = WSOpcode.CONTINUE
 
     async def write_ws_error(
-        self,
-        writer: asyncio.StreamWriter,
-        status: int = 1000,
-        reason: str = "",
+        self, writer: asyncio.StreamWriter, status: int = 1000, reason: str = ""
     ):
         if writer.is_closing():
             raise _OSError("Try calling write_ws_error on closed connection!")
@@ -818,42 +842,35 @@ class Server:
         asyncio.create_task(close_after_timeout())
         _logger.debug(f"Closed ws connection : /{_code}/{reason}/.")
 
-    async def ws_conn_listener(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        ws_conn_info: WSConnParams,
-    ):
+    async def ws_conn_listener(self, sock_obj: SockObj):
         """Responsible for handling control codes"""
 
         async def _keep_connection():
             try:
                 while True:
                     await asyncio.sleep(5)
-                    if writer.is_closing():
+                    if sock_obj.writer.is_closing():
                         break
 
                     time_now = time()
 
                     # check timeouts
-                    if time_now - ws_conn_info[
-                        "_last_active"
-                    ] > WS_MAX_LAST_ACTIVE_TIME or (
-                        ws_conn_info["_last_ping_send"]
-                        and time_now - ws_conn_info["_last_ping_send"]
+                    if time_now - sock_obj._last_active > WS_MAX_LAST_ACTIVE_TIME or (
+                        sock_obj._last_ping_send
+                        and time_now - sock_obj._last_ping_send
                         > WS_MAX_PING_RESPONSE_TIME
                     ):
-                        ws_conn_info["_closing_code"] = 1001
-                        ws_conn_info["_closing_reason"] = "Going Away"
-                        await self.write_ws_error(writer, 1001)
+                        sock_obj._closing_code = 1001
+                        sock_obj._closing_reason = "Going Away"
+                        await self.write_ws_error(sock_obj.writer, 1001)
                         break
 
                     # send ping
-                    if time_now - ws_conn_info["_last_pong"] > WS_PING_INTERVEL:
+                    if time_now - sock_obj._last_pong > WS_PING_INTERVEL:
                         await self._write_ws_frame(
-                            1, WSOpcode.PING, b"vanillacorn", writer
+                            1, WSOpcode.PING, b"vanillacorn", sock_obj.writer
                         )
-                        ws_conn_info["_last_ping_send"] = time()
+                        sock_obj._last_ping_send = time()
             except asyncio.CancelledError:
                 ...
 
@@ -861,20 +878,20 @@ class Server:
         try:
             while True:
                 await asyncio.sleep(0)
-                if writer.is_closing():
+                if sock_obj.writer.is_closing():
                     break
 
                 try:
-                    opcode, data = await self._read_message_fragment(reader)
-                    ws_conn_info["_last_active"] = time()
+                    opcode, data = await self._read_message_fragment(sock_obj.reader)
+                    sock_obj._last_active = time()
                 except ValueError:
-                    await self.write_ws_error(writer, 1002)
+                    await self.write_ws_error(sock_obj.writer, 1002)
                     break
 
                 match opcode:
                     case WSOpcode.TXT | WSOpcode.BYTES:
                         try:
-                            await ws_conn_info["recv_queue"].put(
+                            await sock_obj.recv_queue.put(
                                 WSASGIMsg(
                                     type="websocket.receive",
                                     text=(
@@ -886,41 +903,34 @@ class Server:
                                 )
                             )
                         except UnicodeDecodeError:
-                            await self.write_ws_error(writer, 1002)
+                            await self.write_ws_error(sock_obj.writer, 1002)
                             break
                     case WSOpcode.CLOSE:
                         if len(data) < 2:
-                            ws_conn_info["_closing_code"] = 1005  # asgi spec default
+                            sock_obj._closing_code = 1005  # asgi spec default
                         else:
-                            ws_conn_info["_closing_code"] = struct.unpack(
-                                "!H", data[:2]
-                            )[0]
+                            sock_obj._closing_code = struct.unpack("!H", data[:2])[0]
                             try:
                                 if data[2:]:
-                                    ws_conn_info["_closing_reason"] = data[2:].decode(
-                                        "utf-8"
-                                    )
+                                    sock_obj._closing_reason = data[2:].decode("utf-8")
                             except UnicodeDecodeError:
-                                ws_conn_info["_closing_reason"] = "<Invalid UTF-8>"
+                                sock_obj._closing_reason = "<Invalid UTF-8>"
                         _logger.debug(
-                            f"Client closed ws connection : {ws_conn_info['_closing_code']}"
+                            f"Client closed ws connection : {sock_obj._closing_code}"
                         )
                         # await self.write_ws_error(writer, ws_conn_info["_closing_code"]) response is not required from server it seems
-                        writer.close()
-                        await writer.wait_closed()
+                        sock_obj.writer.close()
+                        await sock_obj.writer.wait_closed()
                         break
 
                     case WSOpcode.PING:
                         await self._write_ws_frame(
-                            1,
-                            WSOpcode.PONG,
-                            data,
-                            writer,
+                            1, WSOpcode.PONG, data, sock_obj.writer
                         )
-                        ws_conn_info["_last_pong"] = time()
+                        sock_obj._last_pong = time()
                     case WSOpcode.PONG:
-                        ws_conn_info["_last_ping_send"] = 0
-                        ws_conn_info["_last_pong"] = time()
+                        sock_obj._last_ping_send = 0
+                        sock_obj._last_pong = time()
                     case _:
                         raise NotImplementedError("Invalid opcode in ws_conn_listener")
         except asyncio.CancelledError:
@@ -931,24 +941,18 @@ class Server:
             except:
                 ...
 
-    def compose_ws_recv(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        parser_info: ParserInfo,
-        ws_conn_info: WSConnParams,
-    ):
+    def compose_ws_recv(self, sock_obj: SockObj):
         def _get_disconnect_info_if():
-            if writer.is_closing():
+            if sock_obj.writer.is_closing():
                 try:
-                    if ws_conn_info["listen_task"]:
-                        ws_conn_info["listen_task"].cancel()
+                    if sock_obj.listen_task:
+                        sock_obj.listen_task.cancel()
                 except:
                     ...
                 return WSASGIMsg(
                     type="websocket.disconnect",
-                    code=ws_conn_info["_closing_code"] or 1005,
-                    reason=ws_conn_info["_closing_reason"] or "",
+                    code=sock_obj._closing_code or 1005,
+                    reason=sock_obj._closing_reason or "",
                 )
             return
 
@@ -957,7 +961,7 @@ class Server:
             if dis_res:
                 return dis_res
 
-            if not ws_conn_info["sock_connected"]:
+            if not sock_obj.sock_connected:
                 return WSASGIMsg(type="websocket.connect", text=None, bytes=None)
 
             while True:
@@ -965,48 +969,40 @@ class Server:
                 if dis_res:
                     return dis_res
                 try:
-                    return await asyncio.wait_for(ws_conn_info["recv_queue"].get(), 1)
+                    return await asyncio.wait_for(sock_obj.recv_queue.get(), 1)
                 except asyncio.TimeoutError:
                     continue
 
         return ws_recv
 
-    def compose_ws_send(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        parser_info: ParserInfo,
-        ws_conn_info: WSConnParams,
-    ):
+    def compose_ws_send(self, sock_obj: SockObj):
         async def ws_send(msg: WSASGISendArg):
-            if writer.is_closing():
+            if sock_obj.writer.is_closing():
                 try:
-                    if ws_conn_info["listen_task"]:
-                        ws_conn_info["listen_task"].cancel()
+                    if sock_obj.listen_task:
+                        sock_obj.listen_task.cancel()
                 except:
                     ...
                 raise _OSError("Socket closed!")
 
             elif msg["type"] == "websocket.accept":
                 # ignoring ws subprotocol from msg["subprotocol"]
-                await self._upgrade_ws_conn(writer, parser_info, msg.get("headers", []))
+                await self._upgrade_ws_conn(sock_obj, msg.get("headers", []))
                 _now = time()
-                ws_conn_info["sock_connected"] = True
-                ws_conn_info["_last_active"] = _now
-                ws_conn_info["_last_ping_send"] = 0
-                ws_conn_info["_last_pong"] = _now
-                ws_conn_info["listen_task"] = asyncio.create_task(
-                    self.ws_conn_listener(reader, writer, ws_conn_info)
+                sock_obj.sock_connected = True
+                sock_obj._last_active = _now
+                sock_obj._last_ping_send = 0
+                sock_obj._last_pong = _now
+                sock_obj.listen_task = asyncio.create_task(
+                    self.ws_conn_listener(sock_obj)
                 )
 
-            elif (
-                msg["type"] == "websocket.close" and not ws_conn_info["sock_connected"]
-            ):
-                await self.write_errors(writer, 403, parser_info)
+            elif msg["type"] == "websocket.close" and not sock_obj.sock_connected:
+                await self.write_errors(sock_obj, 403)
 
             elif msg["type"] == "websocket.close":
                 await self.write_ws_error(
-                    writer,
+                    sock_obj.writer,
                     status=int(msg.get("code", 1000)),
                     reason=msg.get("reason", ""),
                 )
@@ -1014,117 +1010,67 @@ class Server:
             elif msg["type"] == "websocket.send":
                 if msg.get("text") is not None:
                     await self._write_message_fragment(
-                        WSOpcode.TXT, msg["text"].encode("utf-8"), writer  #
+                        WSOpcode.TXT, msg["text"].encode("utf-8"), sock_obj.writer
                     )
                 elif msg.get("bytes") is not None:
                     await self._write_message_fragment(
-                        WSOpcode.BYTES, msg["bytes"], writer
+                        WSOpcode.BYTES, msg["bytes"], sock_obj.writer
                     )
                 else:
-                    await self.write_ws_error(writer, status=1011)
+                    await self.write_ws_error(sock_obj.writer, status=1011)
                     raise ValueError(
                         "send type='websocket.send' should contain either 'text' or 'bytes'"
                     )
 
         return ws_send
 
-    # client handlers
-    async def handle_http_cli(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        _spec: dict,
-        _parser_info: ParserInfo,
-    ):
-        try:
-            await self.app(
-                _spec,
-                self.compose_http_recv(reader, _parser_info),
-                self.compose_http_send(writer, _parser_info),
-            )
-        except _OSError:
-            ...
-        except Exception as exp:
-            _logger.exception(f"ASGI applicatoin error on handling request: {exp}")
-            try:
-                await self.write_errors(
-                    writer, 500, _parser_info, "Internal Server Error!"
-                )
-            except:
-                ...
-
-    async def handle_ws_cli(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        _spec: dict,
-        _parser_info: ParserInfo,
-    ):
-        if await self._validate_ws_req(writer, _parser_info):
-            _ws_conn_info: WSConnParams = {
-                "recv_queue": asyncio.Queue(),
-                "sock_connected": False,
-                "_closing_reason": None,
-                "_closing_code": None,
-                "_last_active": 0,
-                "_last_ping_send": 0,
-                "_last_pong": 0,
-                "listen_task": None,
-            }
-            try:
-                await self.app(
-                    _spec,
-                    self.compose_ws_recv(reader, writer, _parser_info, _ws_conn_info),
-                    self.compose_ws_send(reader, writer, _parser_info, _ws_conn_info),
-                )
-            except _OSError:
-                ...
-            except Exception as exp:
-                _logger.exception(f"Error in ASGI app. closing ws connection : {exp}")
-                try:
-                    await self.write_ws_error(writer, 1011)
-                except:
-                    ...
-            finally:
-                try:
-                    if _ws_conn_info["listen_task"]:
-                        _ws_conn_info["listen_task"].cancel()
-                except:
-                    ...
+    def compose_asgi_callables(self, sock_obj: SockObj) -> Tuple[Callable, Callable]:
+        _type = sock_obj.scope["type"]
+        if _type == ASGIScopeType.HTTP:
+            return self.compose_http_recv(sock_obj), self.compose_http_send(sock_obj)
+        if _type == ASGIScopeType.WEBSOCKET:
+            return self.compose_ws_recv(sock_obj), self.compose_ws_send(sock_obj)
+        else:
+            raise NotImplementedError(f"Invalid asgi scope! scope['type']={_type}")
 
     async def handle_cli(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        _spec = dict()
-        _spec["client"] = writer.get_extra_info("peername")[:2]
-        _parser_info: ParserInfo = {
-            "content_length": "",
-            "chunked_encoding": False,
-            "http_version_str": "HTTP/1.1",
-            "req_path": "",
-            "req_addr": "",
-            "req_method": "",
-            "sec_webSocket_key": "",
-            "sec_webSocket_version": 0,
-            "header_upgrade": "",
-            "header_connection": "",
-        }
-        try:
-            await self._parse_scope(reader, _spec, _parser_info)
-        except Exception as exp:
-            _logger.debug(f"Error parsing request: {exp}")
-            await self.write_errors(writer, 400, _parser_info, "Bad Request!")
+        sock_obj = SockObj(writer, reader)
+        req_addr = writer.get_extra_info("peername")[:2]
+        sock_obj.scope["client"] = req_addr
+        sock_obj.req_addr = req_addr
 
         try:
-            if _spec["type"] == ASGIScopeType.HTTP.value:
-                await self.handle_http_cli(reader, writer, _spec, _parser_info)
-            elif _spec["type"] == ASGIScopeType.WEBSOCKET.value:
-                await self.handle_ws_cli(reader, writer, _spec, _parser_info)
-            else:
-                NotImplementedError(
-                    f"Invalid asgi scope! scope['type']={_spec['type']}"
-                )
+            await self._parse_scope(sock_obj)
+        except Exception as exp:
+            _logger.debug(f"Error parsing request: {exp}")
+            await self.write_errors(sock_obj, 400, "Bad Request!")
+
+        try:
+            _type = sock_obj.scope["type"]
+            if _type == ASGIScopeType.WEBSOCKET:
+                if not await self._validate_ws_req(sock_obj):
+                    return
+
+            try:
+                await self.app(sock_obj.scope, *self.compose_asgi_callables(sock_obj))
+            except (NotImplementedError, _OSError) as exp:
+                raise exp
+            except Exception as exp:
+                _logger.exception(f"ASGI applicatoin error on handling request: {exp}")
+                if _type == ASGIScopeType.HTTP:
+                    return await self.write_errors(
+                        sock_obj, 500, "Internal Server Error!"
+                    )
+                # ws
+                return await self.write_ws_error(sock_obj.writer, 1011)
+
+        except _OSError:
+            ...
         finally:
+            if sock_obj.listen_task:
+                sock_obj.listen_task.cancel()
             if not writer.is_closing():
                 writer.close()
                 await writer.wait_closed()
