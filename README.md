@@ -1,4 +1,4 @@
-<img src="https://github.com/bRuttaZz/vanillacorn/blob/main/misc/logo.png?raw=true" align="right" width="100px">
+<img src="https://raw.githubusercontent.com/bRuttaZz/vanillacorn/main/misc/logo.png" align="right" width="100px">
 
 # Vanillacorn
 
