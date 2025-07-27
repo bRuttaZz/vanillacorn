@@ -49,7 +49,6 @@ jobs:
           tag: ${{ github.ref_name }}
         run: |
           gh release create "$tag" \
-              --repo="$GITHUB_REPOSITORY" \
               --title="$tag" \
               --notes-from-tag
 
