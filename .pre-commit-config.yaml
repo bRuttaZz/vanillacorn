@@ -1,13 +1,25 @@
 repos:
+  - repo: https://github.com/PyCQA/isort
+    rev: 6.0.1
+    hooks:
+      - id: isort
+        args: ["--profile=black"]
+
   - repo: https://github.com/psf/black
     rev: 24.3.0
     hooks:
       - id: black
-        language_version: python3.10
+        language_version: python3.9
+
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.403
+    hooks:
+      - id: pyright
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
       - id: check-ast
+      - id: check-yaml
       - id: end-of-file-fixer
       - id: trailing-whitespace

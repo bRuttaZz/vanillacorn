@@ -2,18 +2,24 @@
 name = "vanillacorn"
 dynamic = ["version"]
 dependencies = []
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [{ name = "bRuttaZz", email = "agrajpdas@gmail.com" }]
 description = "A vanilla ASGI server: a basic implementation of the ASGI specification using pure Python and asyncio."
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "GPL-3.0"
 license-files = ["LICENSE.txt"]
-keywords = ["server", "asgi", "vanilla", "pure python", "simple server"]
+keywords = ["server", "asgi", "vanilla", "pure python", "single file", "cli"]
 classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Python :: Implementation :: PyPy",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Server",
+    "Topic :: Software Development",
 ]
 
 [project.scripts]
