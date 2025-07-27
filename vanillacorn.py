@@ -227,6 +227,8 @@ class SockObj:
         self._last_active: float = 0
         self._last_ping_send: float = 0
         self._last_pong: float = 0
+        self._client_closeframe: bool = False
+        self._server_closeframe: bool = False
 
 
 class Server:
@@ -811,11 +813,24 @@ class Server:
                 break
             opcode = WSOpcode.CONTINUE
 
-    async def write_ws_error(
-        self, writer: asyncio.StreamWriter, status: int = 1000, reason: str = ""
+    async def wait_for_ws_grace_closure(self, sock_obj: SockObj, timeout: float = 5):
+        _time = time()
+        while True:
+            await asyncio.sleep(0)
+            if sock_obj._client_closeframe or time() - _time > timeout:
+                return
+
+    async def write_ws_closeframe(
+        self, sock_obj: SockObj, status: int = 1000, reason: str = ""
     ):
-        if writer.is_closing():
-            raise _OSError("Try calling write_ws_error on closed connection!")
+        if sock_obj.writer.is_closing():
+            raise _OSError("Try calling write_ws_closeframe on closed connection!")
+        if (
+            sock_obj._server_closeframe
+        ):  # if server already sent closeframe close the conn
+            sock_obj.writer.close()
+            await sock_obj.writer.wait_closed()
+            return
 
         _code = 1000  # fallback according to ASGI spec
         if f"status_{status}" in WSStatusMessages.__members__:
@@ -830,16 +845,15 @@ class Server:
         payload = struct.pack("!H", _code) + reason.encode(  # first two bytes (us)
             "utf-8"
         )
-        await self._write_ws_frame(1, WSOpcode.CLOSE, payload, writer)
+        await self._write_ws_frame(1, WSOpcode.CLOSE, payload, sock_obj.writer)
 
-        async def close_after_timeout():
-            """Ideally should wait for client's response to complete a handshake. Fallback for client taking too much response time"""
-            await asyncio.sleep(5)
-            writer.close()
-            await writer.wait_closed()
-            _logger.debug("Server side closure confirmed")
-
-        asyncio.create_task(close_after_timeout())
+        sock_obj._server_closeframe = True
+        if not sock_obj._client_closeframe:
+            await self.wait_for_ws_grace_closure(
+                sock_obj, WS_MAX_PING_RESPONSE_TIME / 2
+            )
+        sock_obj.writer.close()
+        return await sock_obj.writer.wait_closed()
         _logger.debug(f"Closed ws connection : /{_code}/{reason}/.")
 
     async def ws_conn_listener(self, sock_obj: SockObj):
@@ -862,7 +876,7 @@ class Server:
                     ):
                         sock_obj._closing_code = 1001
                         sock_obj._closing_reason = "Going Away"
-                        await self.write_ws_error(sock_obj.writer, 1001)
+                        await self.write_ws_closeframe(sock_obj, 1001)
                         break
 
                     # send ping
@@ -885,7 +899,7 @@ class Server:
                     opcode, data = await self._read_message_fragment(sock_obj.reader)
                     sock_obj._last_active = time()
                 except ValueError:
-                    await self.write_ws_error(sock_obj.writer, 1002)
+                    await self.write_ws_closeframe(sock_obj, 1002)
                     break
 
                 match opcode:
@@ -903,7 +917,7 @@ class Server:
                                 )
                             )
                         except UnicodeDecodeError:
-                            await self.write_ws_error(sock_obj.writer, 1002)
+                            await self.write_ws_closeframe(sock_obj, 1002)
                             break
                     case WSOpcode.CLOSE:
                         if len(data) < 2:
@@ -918,9 +932,8 @@ class Server:
                         _logger.debug(
                             f"Client closed ws connection : {sock_obj._closing_code}"
                         )
-                        # await self.write_ws_error(writer, ws_conn_info["_closing_code"]) response is not required from server it seems
-                        sock_obj.writer.close()
-                        await sock_obj.writer.wait_closed()
+                        sock_obj._client_closeframe = True
+                        await self.write_ws_closeframe(sock_obj, 1001)
                         break
 
                     case WSOpcode.PING:
@@ -1001,8 +1014,8 @@ class Server:
                 await self.write_errors(sock_obj, 403)
 
             elif msg["type"] == "websocket.close":
-                await self.write_ws_error(
-                    sock_obj.writer,
+                await self.write_ws_closeframe(
+                    sock_obj,
                     status=int(msg.get("code", 1000)),
                     reason=msg.get("reason", ""),
                 )
@@ -1017,7 +1030,7 @@ class Server:
                         WSOpcode.BYTES, msg["bytes"], sock_obj.writer
                     )
                 else:
-                    await self.write_ws_error(sock_obj.writer, status=1011)
+                    await self.write_ws_closeframe(sock_obj, status=1011)
                     raise ValueError(
                         "send type='websocket.send' should contain either 'text' or 'bytes'"
                     )
@@ -1064,7 +1077,7 @@ class Server:
                         sock_obj, 500, "Internal Server Error!"
                     )
                 # ws
-                return await self.write_ws_error(sock_obj.writer, 1011)
+                return await self.write_ws_closeframe(sock_obj, 1011)
 
         except _OSError:
             ...
