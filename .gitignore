@@ -6,5 +6,6 @@ dist
 venv
 .venv
 *.log
+*.pem
 
 test_app.py

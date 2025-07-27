@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 import os
 import socket
+import ssl
 import struct
 import sys
 from base64 import b64encode
@@ -186,16 +187,25 @@ class Server:
         app: Callable[[dict, Callable, Callable], Coroutine] | str,
         port: int = 8075,
         host: str = "localhost",
+        ssl_key: str = "",
+        ssl_cert: str = "",
+        ssl_context: ssl.SSLContext | None = None,
     ):
         self.id: int | None = None
         self.host: str = host
         self.port: int = port
+
         self.app: Callable[[dict, Callable, Callable], Coroutine]
         if isinstance(app, str):
             self.app = self.load_app(app)
         else:
             self.app = app
-        self.tls_enabled = False  # TODO: tls support
+
+        self.ssl_key = ssl_key
+        self.ssl_cert = ssl_cert
+        self.ssl_context: ssl.SSLContext | None = ssl_context
+        self.tls_enabled = True if ssl_context or (ssl_key and ssl_cert) else False
+
         self.life_span: LifeSpan = LifeSpan.IDLE
         self.life_span_state = dict()
         self._common_scopes = {
@@ -235,6 +245,12 @@ class Server:
             raise ValueError(f"ASGI app is not callable: {ref_path}")
         return app
 
+    @classmethod
+    def load_ssl(cls, ssl_key: str, ssl_cert: str) -> ssl.SSLContext:
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+        return ssl_context
+
     def run(self, id: int = 0):
         """Start server on an eventloop"""
         self.id = id
@@ -269,15 +285,21 @@ class Server:
 
     async def start_server(self):
         """Start server"""
-        server = await asyncio.start_server(
-            self.handle_cli,
-            host=self.host,
-            port=self.port,
-            family=socket.AF_UNSPEC,
-            reuse_address=True,
-            reuse_port=True,
-        )
+        _kwargs = {
+            "host": self.host,
+            "port": self.port,
+            "family": socket.AF_UNSPEC,
+            "reuse_address": True,
+            "reuse_port": True,
+        }
+        if self.tls_enabled:
+            if not self.ssl_context:
+                self.ssl_context = self.load_ssl(self.ssl_key, self.ssl_cert)
+            _kwargs["ssl"] = self.ssl_context
+
+        server = await asyncio.start_server(self.handle_cli, **_kwargs)
         _logger.info(f"Started server process [{self.id}]")
+
         self._addr = server.sockets[0].getsockname()[:2]
         async with server:
             self.life_span = LifeSpan.STARTUP
@@ -763,7 +785,10 @@ class Server:
             opcode = WSOpcode.CONTINUE
 
     async def write_ws_error(
-        self, writer: asyncio.StreamWriter, status: int = 1000, reason: str = ""
+        self,
+        writer: asyncio.StreamWriter,
+        status: int = 1000,
+        reason: str = "",
     ):
         if writer.is_closing():
             raise _OSError("Try calling write_ws_error on closed connection!")
@@ -782,8 +807,15 @@ class Server:
             "utf-8"
         )
         await self._write_ws_frame(1, WSOpcode.CLOSE, payload, writer)
-        writer.close()
-        await writer.wait_closed()
+
+        async def close_after_timeout():
+            """Ideally should wait for client's response to complete a handshake. Fallback for client taking too much response time"""
+            await asyncio.sleep(5)
+            writer.close()
+            await writer.wait_closed()
+            _logger.debug("Server side closure confirmed")
+
+        asyncio.create_task(close_after_timeout())
         _logger.debug(f"Closed ws connection : /{_code}/{reason}/.")
 
     async def ws_conn_listener(
@@ -870,11 +902,12 @@ class Server:
                                     )
                             except UnicodeDecodeError:
                                 ws_conn_info["_closing_reason"] = "<Invalid UTF-8>"
-                        writer.close()
-                        await writer.wait_closed()
                         _logger.debug(
                             f"Client closed ws connection : {ws_conn_info['_closing_code']}"
                         )
+                        # await self.write_ws_error(writer, ws_conn_info["_closing_code"]) response is not required from server it seems
+                        writer.close()
+                        await writer.wait_closed()
                         break
 
                     case WSOpcode.PING:
@@ -1093,7 +1126,6 @@ class Server:
                 )
         finally:
             if not writer.is_closing():
-                await writer.drain()
                 writer.close()
                 await writer.wait_closed()
 
@@ -1128,14 +1160,31 @@ def setup_logger(
     _logger.setLevel(level)
 
 
-def spin_server(app_ref: str, workers: int = 1, host="localhost", port=8075):
+def spin_server(
+    app_ref: str,
+    workers: int = 1,
+    host="localhost",
+    port=8075,
+    ssl_key: str = "",
+    ssl_cert: str = "",
+):
     """Spin server in worker pool"""
+
     try:
         app = Server.load_app(app_ref)
     except Exception as exp:
         _logger.critical(f"Error loading ASGI app. {exp}")
         exit(2)
-    server = Server(app, host=host, port=port)
+
+    # ensure ssl availability
+    if ssl_key and ssl_cert:
+        try:
+            Server.load_ssl(ssl_key, ssl_cert)
+        except FileNotFoundError as exp:
+            _logger.critical(f"Error loading SSL certs. {exp}")
+            exit(2)
+
+    server = Server(app, host=host, port=port, ssl_key=ssl_key, ssl_cert=ssl_cert)
 
     with multiprocessing.Pool(workers) as pool:
         try:
@@ -1176,7 +1225,26 @@ def cli():
     )
     parser.add_argument("--verbose", action="store_true", help="Show detailed logging")
     parser.add_argument(
-        "-l", "--log-file", type=str, default="", help="Write server logs into log file"
+        "-l",
+        "--log-file",
+        type=str,
+        default="",
+        metavar="FILE",
+        help="Write server logs into log file",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        type=str,
+        default="",
+        metavar="FILE",
+        help="SSL key file for TLS",
+    )
+    parser.add_argument(
+        "--ssl-certfile",
+        type=str,
+        default="",
+        metavar="FILE",
+        help="SSL certfile for TLS",
     )
 
     args = parser.parse_args()
@@ -1200,6 +1268,8 @@ def cli():
             workers=args.workers,
             host=args.host,
             port=args.port,
+            ssl_key=args.ssl_keyfile,
+            ssl_cert=args.ssl_certfile,
         )
 
 
