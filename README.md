@@ -2,7 +2,7 @@
 
 # Vanillacorn
 
-**Nothing but a vanilla ASGI server.**
+**Nothing but a vanilla-py ASGI server.**
 
 [![pypi](https://img.shields.io/pypi/v/vanillacorn.svg)](https://pypi.org/project/vanillacorn/)
 ![pyright-status](https://github.com/bruttazz/vanillacorn/actions/workflows/pyright.yml/badge.svg)
@@ -37,7 +37,7 @@ python3 vanillacorn.py --help
 
 # Usage
 
-```sh
+```txt
 usage: vanillacorn [-h] [-v] [-p PORT] [-b HOST] [-w WORKERS] [-s] [--verbose] [-l FILE] [--ssl-keyfile FILE] [--ssl-certfile FILE] [asgi_app]
 
 A simple ASGI server: a basic implementation of the ASGI specification using pure Python and asyncio.
