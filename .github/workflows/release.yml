@@ -48,10 +48,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ github.ref_name }}
         run: |
-          notes=$(git for-each-ref refs/tags/$tag --format='%(contents)' | sed '/^-----BEGIN PGP SIGNATURE-----/,$d')
           gh release create "$tag" \
               --title="$tag" \
-              --notes="$notes"
+              --generate-notes
 
       - name: Upload Assets
         env:
